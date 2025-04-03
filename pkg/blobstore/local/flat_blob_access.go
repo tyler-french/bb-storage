@@ -58,7 +58,7 @@ type flatBlobAccess struct {
 	locationBlobMap LocationBlobMap
 	digestKeyFormat digest.KeyFormat
 
-	lock        *sync.RWMutex
+	lock        *ShardedLock
 	refreshLock sync.Mutex
 
 	refreshesBlobsGet              prometheus.Observer
@@ -86,13 +86,17 @@ func NewFlatBlobAccess(keyLocationMap KeyLocationMap, locationBlobMap LocationBl
 		prometheus.MustRegister(flatBlobAccessRefreshesSizeBytes)
 	})
 
+	// Create a sharded lock with 64 shards for optimal concurrency
+	// We ignore the provided lock parameter to use a sharded lock instead
+	shardedLock := NewShardedLock(64)
+
 	return &flatBlobAccess{
 		Provider: capabilitiesProvider,
 
 		keyLocationMap:  keyLocationMap,
 		locationBlobMap: locationBlobMap,
 		digestKeyFormat: digestKeyFormat,
-		lock:            lock,
+		lock:            shardedLock,
 
 		refreshesBlobsGet:              flatBlobAccessRefreshesBlobs.WithLabelValues(storageType, "Get"),
 		refreshesBlobsGetFromComposite: flatBlobAccessRefreshesBlobs.WithLabelValues(storageType, "GetFromComposite"),
@@ -125,10 +129,10 @@ func (ba *flatBlobAccess) Get(ctx context.Context, blobDigest digest.Digest) buf
 	key := ba.getKey(blobDigest)
 
 	// Look up the blob in storage while holding a read lock.
-	ba.lock.RLock()
+	ba.lock.RLock(key)
 	location, err := ba.keyLocationMap.Get(key)
 	if err != nil {
-		ba.lock.RUnlock()
+		ba.lock.RUnlock(key)
 		return buffer.NewBufferFromError(err)
 	}
 	getter, needsRefresh := ba.locationBlobMap.Get(location)
@@ -136,10 +140,10 @@ func (ba *flatBlobAccess) Get(ctx context.Context, blobDigest digest.Digest) buf
 		// The blob doesn't need to be refreshed, so we can
 		// return its data directly.
 		b := getter(blobDigest)
-		ba.lock.RUnlock()
+		ba.lock.RUnlock(key)
 		return b
 	}
-	ba.lock.RUnlock()
+	ba.lock.RUnlock(key)
 
 	// Blob was found, but it needs to be refreshed to ensure it
 	// doesn't disappear. Retry loading the blob a second time, this
@@ -152,10 +156,10 @@ func (ba *flatBlobAccess) Get(ctx context.Context, blobDigest digest.Digest) buf
 	// picking up the refresh lock?
 	refreshStart := time.Now()
 
-	ba.lock.Lock()
+	ba.lock.Lock(key)
 	location, err = ba.keyLocationMap.Get(key)
 	if err != nil {
-		ba.lock.Unlock()
+		ba.lock.Unlock(key)
 		return buffer.NewBufferFromError(err)
 	}
 	getter, needsRefresh = ba.locationBlobMap.Get(location)
@@ -163,13 +167,13 @@ func (ba *flatBlobAccess) Get(ctx context.Context, blobDigest digest.Digest) buf
 	if !needsRefresh {
 		// Some other thread managed to refresh the blob before
 		// we got the write lock. No need to copy anymore.
-		ba.lock.Unlock()
+		ba.lock.Unlock(key)
 		return b
 	}
 
 	// Allocate space for the copy.
 	putWriter, err := ba.locationBlobMap.Put(location.SizeBytes)
-	ba.lock.Unlock()
+	ba.lock.Unlock(key)
 	if err != nil {
 		b.Discard()
 		return buffer.NewBufferFromError(util.StatusWrap(err, "Failed to refresh blob"))
@@ -180,14 +184,14 @@ func (ba *flatBlobAccess) Get(ctx context.Context, blobDigest digest.Digest) buf
 	b1, b2 := b.CloneStream()
 	return b1.WithTask(func() error {
 		putFinalizer := putWriter(b2)
-		ba.lock.Lock()
+		ba.lock.Lock(key)
 		_, err := ba.finalizePut(putFinalizer, key)
 		if err == nil {
 			ba.refreshesBlobsGet.Observe(1)
 			ba.refreshesBlobsSizeGet.Observe(float64(location.SizeBytes))
 			ba.refreshesBlobsDurationGet.Observe(time.Since(refreshStart).Seconds())
 		}
-		ba.lock.Unlock()
+		ba.lock.Unlock(key)
 		if err != nil {
 			return util.StatusWrap(err, "Failed to refresh blob")
 		}
@@ -203,27 +207,31 @@ func (ba *flatBlobAccess) GetFromComposite(ctx context.Context, parentDigest, ch
 	// though the child object determines the data to be returned,
 	// the parent object controls whether it needs to be refreshed.
 	// We therefore look up both unconditionally.
-	ba.lock.RLock()
+	ba.lock.RLock(parentKey)
 	parentLocation, err := ba.keyLocationMap.Get(parentKey)
 	if err != nil {
-		ba.lock.RUnlock()
+		ba.lock.RUnlock(parentKey)
 		return buffer.NewBufferFromError(err)
 	}
 	if _, needsRefresh := ba.locationBlobMap.Get(parentLocation); !needsRefresh {
+		ba.lock.RLock(childKey)
 		if childLocation, err := ba.keyLocationMap.Get(childKey); err == nil {
 			// The parent object doesn't need to be
 			// refreshed, and the child object exists.
 			// Return the child object immediately.
 			childGetter, _ := ba.locationBlobMap.Get(childLocation)
 			b := childGetter(childDigest)
-			ba.lock.RUnlock()
+			ba.lock.RUnlock(childKey)
+			ba.lock.RUnlock(parentKey)
 			return b
 		} else if status.Code(err) != codes.NotFound {
-			ba.lock.RUnlock()
+			ba.lock.RUnlock(childKey)
+			ba.lock.RUnlock(parentKey)
 			return buffer.NewBufferFromError(err)
 		}
+		ba.lock.RUnlock(childKey)
 	}
-	ba.lock.RUnlock()
+	ba.lock.RUnlock(parentKey)
 
 	// The parent object was found, but it either hasn't been sliced
 	// yet, or it needs to be refreshed to ensure it doesn't
@@ -232,10 +240,10 @@ func (ba *flatBlobAccess) GetFromComposite(ctx context.Context, parentDigest, ch
 	ba.refreshLock.Lock()
 	defer ba.refreshLock.Unlock()
 
-	ba.lock.Lock()
+	ba.lock.Lock(parentKey)
 	parentLocation, err = ba.keyLocationMap.Get(parentKey)
 	if err != nil {
-		ba.lock.Unlock()
+		ba.lock.Unlock(parentKey)
 		return buffer.NewBufferFromError(err)
 	}
 
@@ -248,7 +256,7 @@ func (ba *flatBlobAccess) GetFromComposite(ctx context.Context, parentDigest, ch
 		// The parent object needs to be refreshed and sliced.
 		bParent := parentGetter(parentDigest)
 		putWriter, err := ba.locationBlobMap.Put(parentLocation.SizeBytes)
-		ba.lock.Unlock()
+		ba.lock.Unlock(parentKey)
 		if err != nil {
 			bParent.Discard()
 			return buffer.NewBufferFromError(util.StatusWrap(err, "Failed to refresh blob"))
@@ -261,21 +269,25 @@ func (ba *flatBlobAccess) GetFromComposite(ctx context.Context, parentDigest, ch
 			return nil
 		})
 	} else {
+		ba.lock.RLock(childKey)
 		if childLocation, err := ba.keyLocationMap.Get(childKey); err == nil {
 			// The parent object was refreshed and sliced in
 			// the meantime.
 			childGetter, _ := ba.locationBlobMap.Get(childLocation)
 			b := childGetter(childDigest)
-			ba.lock.Unlock()
+			ba.lock.RUnlock(childKey)
+			ba.lock.Unlock(parentKey)
 			return b
 		} else if status.Code(err) != codes.NotFound {
-			ba.lock.Unlock()
+			ba.lock.RUnlock(childKey)
+			ba.lock.Unlock(parentKey)
 			return buffer.NewBufferFromError(err)
 		}
+		ba.lock.RUnlock(childKey)
 
 		// The parent object only needs to be sliced.
 		bParentSlicing = parentGetter(parentDigest)
-		ba.lock.Unlock()
+		ba.lock.Unlock(parentKey)
 	}
 
 	// Perform the slicing.
@@ -286,13 +298,13 @@ func (ba *flatBlobAccess) GetFromComposite(ctx context.Context, parentDigest, ch
 	}
 
 	// Complete refreshing in case it was performed.
-	ba.lock.Lock()
+	ba.lock.Lock(parentKey)
 	if needsRefresh {
 		parentLocation, err = ba.finalizePut(putFinalizer, parentKey)
 		// Add size metric before refresh
 		ba.refreshesBlbosSizeGetFromComposite.Observe(float64(parentLocation.SizeBytes))
 		if err != nil {
-			ba.lock.Unlock()
+			ba.lock.Unlock(parentKey)
 			bChild.Discard()
 			return buffer.NewBufferFromError(util.StatusWrap(err, "Failed to refresh blob"))
 		}
@@ -304,17 +316,21 @@ func (ba *flatBlobAccess) GetFromComposite(ctx context.Context, parentDigest, ch
 	// permits subsequent GetFromComposite() calls to access the
 	// individual parts without any slicing.
 	for i, slice := range slices {
-		if err := ba.keyLocationMap.Put(sliceKeys[i], Location{
+		sliceKey := sliceKeys[i]
+		ba.lock.Lock(sliceKey)
+		err := ba.keyLocationMap.Put(sliceKey, Location{
 			BlockIndex:  parentLocation.BlockIndex,
 			OffsetBytes: parentLocation.OffsetBytes + slice.OffsetBytes,
 			SizeBytes:   slice.SizeBytes,
-		}); err != nil {
-			ba.lock.Unlock()
+		})
+		ba.lock.Unlock(sliceKey)
+		if err != nil {
+			ba.lock.Unlock(parentKey)
 			bChild.Discard()
 			return buffer.NewBufferFromError(util.StatusWrapf(err, "Failed to create child blob %#v", slice.Digest.String()))
 		}
 	}
-	ba.lock.Unlock()
+	ba.lock.Unlock(parentKey)
 	return bChild
 }
 
@@ -325,10 +341,9 @@ func (ba *flatBlobAccess) Put(ctx context.Context, blobDigest digest.Digest, b b
 		return err
 	}
 
-	// Allocate space to store the object.
-	ba.lock.Lock()
+	// We don't need to hold a lock for a specific key when allocating space,
+	// as this operation deals with global resources
 	putWriter, err := ba.locationBlobMap.Put(sizeBytes)
-	ba.lock.Unlock()
 	if err != nil {
 		b.Discard()
 		return err
@@ -340,9 +355,9 @@ func (ba *flatBlobAccess) Put(ctx context.Context, blobDigest digest.Digest, b b
 	putFinalizer := putWriter(b)
 
 	key := ba.getKey(blobDigest)
-	ba.lock.Lock()
+	ba.lock.Lock(key)
 	_, err = ba.finalizePut(putFinalizer, key)
-	ba.lock.Unlock()
+	ba.lock.Unlock(key)
 	return err
 }
 
@@ -361,9 +376,11 @@ func (ba *flatBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (
 	}
 	var blobsToRefresh []blobToRefresh
 	missing := digest.NewSetBuilder()
-	ba.lock.RLock()
+
+	// Check each key individually with its own lock
 	for i, blobDigest := range digests.Items() {
 		key := keys[i]
+		ba.lock.RLock(key)
 		if location, err := ba.keyLocationMap.Get(key); err == nil {
 			_, needsRefresh := ba.locationBlobMap.Get(location)
 			if needsRefresh {
@@ -379,11 +396,12 @@ func (ba *flatBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (
 			// Blob is absent.
 			missing.Add(blobDigest)
 		} else {
-			ba.lock.RUnlock()
+			ba.lock.RUnlock(key)
 			return digest.EmptySet, util.StatusWrapf(err, "Failed to get blob %#v", blobDigest.String())
 		}
+		ba.lock.RUnlock(key)
 	}
-	ba.lock.RUnlock()
+
 	if len(blobsToRefresh) == 0 {
 		return missing.Build(), nil
 	}
@@ -397,12 +415,14 @@ func (ba *flatBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (
 	// one thread.
 	ba.refreshLock.Lock()
 	defer ba.refreshLock.Unlock()
+
 	// Add refresh start time before the refresh loop
 	refreshStart := time.Now()
 	blobsRefreshedSuccessfully := 0
 	var blobRefreshSizeBytes int64
-	ba.lock.Lock()
+
 	for _, blobToRefresh := range blobsToRefresh {
+		ba.lock.Lock(blobToRefresh.key)
 		if location, err := ba.keyLocationMap.Get(blobToRefresh.key); err == nil {
 			getter, needsRefresh := ba.locationBlobMap.Get(location)
 			if needsRefresh {
@@ -411,7 +431,7 @@ func (ba *flatBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (
 				b := getter(blobToRefresh.digest)
 				blobRefreshSizeBytes += location.SizeBytes
 				putWriter, err := ba.locationBlobMap.Put(location.SizeBytes)
-				ba.lock.Unlock()
+				ba.lock.Unlock(blobToRefresh.key)
 				if err != nil {
 					b.Discard()
 					return digest.EmptySet, util.StatusWrapf(err, "Failed to refresh blob %#v", blobToRefresh.digest.String())
@@ -422,9 +442,9 @@ func (ba *flatBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (
 				// continue to be serviced.
 				putFinalizer := putWriter(b)
 
-				ba.lock.Lock()
+				ba.lock.Lock(blobToRefresh.key)
 				if _, err := ba.finalizePut(putFinalizer, blobToRefresh.key); err != nil {
-					ba.lock.Unlock()
+					ba.lock.Unlock(blobToRefresh.key)
 					return digest.EmptySet, util.StatusWrapf(err, "Failed to refresh blob %#v", blobToRefresh.digest.String())
 				}
 				blobsRefreshedSuccessfully++
@@ -434,11 +454,12 @@ func (ba *flatBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (
 			// scan. Simply report it as missing.
 			missing.Add(blobToRefresh.digest)
 		} else {
-			ba.lock.Unlock()
+			ba.lock.Unlock(blobToRefresh.key)
 			return digest.EmptySet, util.StatusWrapf(err, "Failed to get blob %#v", blobToRefresh.digest.String())
 		}
+		ba.lock.Unlock(blobToRefresh.key)
 	}
-	ba.lock.Unlock()
+
 	ba.refreshesBlobsFindMissing.Observe(float64(blobsRefreshedSuccessfully))
 	ba.refreshesBlobsDurationFindMissing.Observe(time.Since(refreshStart).Seconds())
 	ba.refreshesBlobsSizeFindMissing.Observe(float64(blobRefreshSizeBytes))

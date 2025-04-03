@@ -26,6 +26,7 @@ go_library(
         "persistent_block_list.go",
         "persistent_state_source.go",
         "persistent_state_store.go",
+        "sharded_lock.go",
         "volatile_block_list.go",
     ],
     importpath = "github.com/buildbarn/bb-storage/pkg/blobstore/local",
@@ -65,6 +66,7 @@ go_test(
         "old_current_new_location_blob_map_test.go",
         "periodic_syncer_test.go",
         "persistent_block_list_test.go",
+        "sharded_lock_test.go",
         "volatile_block_list_test.go",
     ],
     deps = [
